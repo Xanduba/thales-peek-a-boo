@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <!-- Tablet friendly: lock zoom, use the full screen (incl. notch areas) -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Peek-a-boo">
+  <meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
+  <meta name="theme-color" content="#f5f5f4">
+  <title>Peek-a-boo</title>
+
+  <!-- Tailwind CSS v3 Play CDN (works on older tablet browsers) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    /* ---------- Tablet / toddler hardening ---------- */
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;          /* no pull-to-refresh / bounce */
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
+
+    *,
+    *::before,
+    *::after {
+      -webkit-user-select: none;          /* no text selection */
+      user-select: none;
+      -webkit-touch-callout: none;        /* no iOS long-press menu */
+      -webkit-tap-highlight-color: transparent;
+      touch-action: none;                 /* no pinch / double-tap zoom / panning */
+    }
+
+    img {
+      -webkit-user-drag: none;
+    }
+
+    /* Respect notches / rounded screen corners */
+    #grid {
+      padding: 12px;
+      padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+               max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    }
+
+    /* ---------- Gentle card motion ---------- */
+    .card {
+      transform-origin: center center;
+      transition: transform 550ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    /* Keep the card above the backdrop while enlarged AND while shrinking back */
+    .card.is-active,
+    .card.is-leaving {
+      z-index: 20;
+    }
+
+    #backdrop {
+      transition: opacity 550ms ease;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .card,
+      #backdrop {
+        transition-duration: 1ms;
+      }
+    }
+  </style>
+</head>
+<body class="bg-stone-100">
+
+  <!-- 2x2 photo grid (cards are rendered from the PEOPLE list below).
+       Note: "absolute" (not "fixed") on purpose: fixed would create a stacking
+       context and trap the enlarged card underneath the backdrop. -->
+  <main id="grid" class="absolute top-0 left-0 right-0 bottom-0 grid grid-cols-2 grid-rows-2 gap-3 sm:gap-4"></main>
+
+  <!-- Soft dim layer: tapping it ("outside" the photo) shrinks the photo back -->
+  <div id="backdrop"
+       class="fixed top-0 left-0 right-0 bottom-0 z-10 bg-stone-900/40 opacity-0 pointer-events-none"
+       aria-hidden="true"></div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      /* ---------- Content: edit names / files here ---------- */
+      var PEOPLE = [
+        { name: 'Mamãe',  image: 'Assets/images/mamae.png',  audio: 'Assets/audio/mamae.mp3',  tint: 'bg-rose-100' },
+        { name: 'Papai',  image: 'Assets/images/papai.png',  audio: 'Assets/audio/papai.mp3',  tint: 'bg-sky-100' },
+        { name: 'Thales', image: 'Assets/images/thales.png', audio: 'Assets/audio/thales.mp3', tint: 'bg-amber-100' },
+        { name: 'Vovó',   image: 'Assets/images/vovo.png',   audio: 'Assets/audio/vovo.mp3',   tint: 'bg-emerald-100' }
+      ];
+
+      /* ---------- Settings ---------- */
+      var ANIMATION_MS = 550;        // must match the CSS transition duration
+      var TAP_COOLDOWN_MS = 450;     // ignores frantic repeated taps
+      var SWIPE_MIN_DISTANCE = 60;   // px downward to count as a "swipe down"
+      var ENLARGED_FILL = 0.82;      // enlarged photo fills ~82% of the screen
+
+      /* ---------- State ---------- */
+      var grid = document.getElementById('grid');
+      var backdrop = document.getElementById('backdrop');
+      var cards = [];
+      var sounds = [];
+      var leaveTimers = [];
+      var activeIndex = -1;
+      var lastActionAt = 0;
+
+      /* ---------- Build the grid ---------- */
+      PEOPLE.forEach(function (person, i) {
+        var card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'card relative overflow-hidden rounded-3xl shadow-md focus:outline-none ' + person.tint;
+        card.setAttribute('aria-label', person.name);
+
+        var img = document.createElement('img');
+        img.src = person.image;
+        img.alt = person.name;
+        img.draggable = false;
+        img.className = 'block w-full h-full object-cover rounded-3xl pointer-events-none';
+        // If a photo is missing, just show the soft tint instead of a broken icon.
+        img.onerror = function () { img.style.visibility = 'hidden'; };
+
+        card.appendChild(img);
+        card.addEventListener('click', function (e) {
+          e.stopPropagation();
+          onCardTap(i);
+        });
+
+        var audio = new Audio();
+        audio.preload = 'auto';
+        audio.src = person.audio;
+
+        grid.appendChild(card);
+        cards.push(card);
+        sounds.push(audio);
+        leaveTimers.push(null);
+      });
+
+      /* ---------- Helpers ---------- */
+      function isCoolingDown() {
+        var now = Date.now();
+        if (now - lastActionAt < TAP_COOLDOWN_MS) return true;
+        lastActionAt = now;
+        return false;
+      }
+
+      function stopSound(i) {
+        var a = sounds[i];
+        a.pause();
+        try { a.currentTime = 0; } catch (err) { /* not loaded yet */ }
+      }
+
+      function stopAllSounds() {
+        for (var i = 0; i < sounds.length; i++) stopSound(i);
+      }
+
+      function playSound(i) {
+        stopAllSounds();
+        var p = sounds[i].play();
+        // p['catch'] (not p.catch) keeps very old tablet browsers happy
+        if (p && typeof p['catch'] === 'function') p['catch'](function () { /* ignore autoplay / load errors */ });
+      }
+
+      // Move the card to the screen center and scale it up.
+      // offset* values ignore transforms, so this is correct even mid-animation.
+      function applyEnlargedTransform(i) {
+        var card = cards[i];
+        var w = card.offsetWidth;
+        var h = card.offsetHeight;
+        var vw = window.innerWidth;
+        var vh = window.innerHeight;
+        var scale = Math.min((vw * ENLARGED_FILL) / w, (vh * ENLARGED_FILL) / h);
+        var dx = vw / 2 - (card.offsetLeft + w / 2);
+        var dy = vh / 2 - (card.offsetTop + h / 2);
+        card.style.transform = 'translate(' + dx + 'px, ' + dy + 'px) scale(' + scale + ')';
+      }
+
+      function showBackdrop(show) {
+        // add/remove instead of toggle(name, force) for older Android WebViews
+        if (show) {
+          backdrop.classList.remove('opacity-0', 'pointer-events-none');
+          backdrop.classList.add('opacity-100');
+        } else {
+          backdrop.classList.remove('opacity-100');
+          backdrop.classList.add('opacity-0', 'pointer-events-none');
+        }
+      }
+
+      /* ---------- Actions ---------- */
+      function expand(i) {
+        var card = cards[i];
+        clearTimeout(leaveTimers[i]);
+        card.classList.remove('is-leaving');
+        card.classList.add('is-active');
+        applyEnlargedTransform(i);
+        showBackdrop(true);
+        activeIndex = i;
+        playSound(i);
+      }
+
+      function collapse() {
+        if (activeIndex === -1) return;
+        var i = activeIndex;
+        var card = cards[i];
+        activeIndex = -1;
+
+        card.style.transform = '';
+        card.classList.remove('is-active');
+        card.classList.add('is-leaving');
+        leaveTimers[i] = setTimeout(function () {
+          card.classList.remove('is-leaving');
+        }, ANIMATION_MS);
+
+        showBackdrop(false);
+        stopSound(i);
+      }
+
+      function onCardTap(i) {
+        if (isCoolingDown()) return;
+        if (activeIndex === i) {
+          playSound(i);           // tap the big photo again -> hear it again
+        } else {
+          collapse();             // safety: never two big photos at once
+          expand(i);
+        }
+      }
+
+      /* ---------- Reset: tap outside ---------- */
+      backdrop.addEventListener('click', function () {
+        if (isCoolingDown()) return;
+        collapse();
+      });
+
+      /* ---------- Reset: swipe down anywhere ---------- */
+      var supportsPassive = false;
+      try {
+        var opts = Object.defineProperty({}, 'passive', {
+          get: function () { supportsPassive = true; return true; }
+        });
+        window.addEventListener('testPassive', null, opts);
+        window.removeEventListener('testPassive', null, opts);
+      } catch (err) { /* old browser */ }
+
+      function listenerOptions(passive) {
+        return supportsPassive ? { passive: passive } : false;
+      }
+
+      var touchStart = null;
+      var lastTouchEnd = 0;
+
+      document.addEventListener('touchstart', function (e) {
+        if (e.touches.length !== 1) { touchStart = null; return; }  // ignore multi-finger
+        touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      }, listenerOptions(true));
+
+      // Block scrolling / pull-to-refresh on browsers that ignore touch-action.
+      document.addEventListener('touchmove', function (e) {
+        e.preventDefault();
+      }, listenerOptions(false));
+
+      document.addEventListener('touchend', function (e) {
+        var now = Date.now();
+
+        if (touchStart && e.changedTouches.length) {
+          var t = e.changedTouches[0];
+          var dx = t.clientX - touchStart.x;
+          var dy = t.clientY - touchStart.y;
+          touchStart = null;
+
+          if (dy > SWIPE_MIN_DISTANCE && dy > Math.abs(dx)) {
+            e.preventDefault();     // swallow the click that might follow
+            lastActionAt = now;
+            lastTouchEnd = now;
+            collapse();
+            return;
+          }
+        }
+
+        // Fallback against double-tap zoom on older iOS. The first tap still
+        // fires a click; only the quick second tap is swallowed (and the tap
+        // cooldown would have ignored it anyway).
+        if (now - lastTouchEnd < 300) e.preventDefault();
+        lastTouchEnd = now;
+      }, listenerOptions(false));
+
+      /* ---------- Extra guards ---------- */
+      ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (type) {
+        document.addEventListener(type, function (e) { e.preventDefault(); }, listenerOptions(false));
+      });
+      document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+      document.addEventListener('dragstart', function (e) { e.preventDefault(); });
+      document.addEventListener('selectstart', function (e) { e.preventDefault(); });
+
+      // Desktop testing convenience
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' || e.keyCode === 27) collapse();
+      });
+
+      // Keep the enlarged photo centered when the tablet is rotated
+      window.addEventListener('resize', function () {
+        if (activeIndex !== -1) applyEnlargedTransform(activeIndex);
+      });
+
+      // Go quiet when the tablet is locked or the tab is hidden
+      document.addEventListener('visibilitychange', function () {
+        if (document.hidden) {
+          collapse();
+          stopAllSounds();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
